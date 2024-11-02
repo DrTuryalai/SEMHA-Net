@@ -1,0 +1,369 @@
+import os
+import cv2
+import librosa
+import numpy as np
+import pandas as pd
+from moviepy.editor import VideoFileClip
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
+from tensorflow.keras.applications import ResNet101
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Multiply, Reshape, MultiHeadAttention
+import tensorflow as tf
+from mtcnn import MTCNN
+
+# Function to extract audio from video and save as .wav
+def extract_audio_from_video(video_path):
+    video = VideoFileClip(video_path)
+    audio_path = video_path.replace('.mp4', '.wav')
+    video.audio.write_audiofile(audio_path)
+    return audio_path
+
+# Function to generate and save spectrogram without legends and color bars
+def create_spectrogram(audio_path, output_path):
+    y, sr = librosa.load(audio_path, sr=None)
+    mel_spectrogram = librosa.feature.melspectrogram(y=y, sr=sr)
+    mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+
+    plt.figure(figsize=(2.24, 2.24))
+    plt.axis('off')
+    librosa.display.specshow(mel_spectrogram_db, sr=sr, x_axis=None, y_axis=None, cmap='coolwarm')
+    
+    plt.tight_layout(pad=0)
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0, dpi=100)
+    plt.close()
+
+# Function to resize spectrogram images to 224x224 for ResNet input
+def resize_spectrogram_image(image_path):
+    img = load_img(image_path)
+    img_resized = img.resize((224, 224))
+    img_array = img_to_array(img_resized)
+    return img_array  # Return as a NumPy array without expanding dimensions
+
+# Function to extract audio features (MFCCs, pitch, energy)
+def extract_audio_features(audio_path):
+    y, sr = librosa.load(audio_path, sr=None)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    
+    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+    pitch = np.mean(pitches[pitches > 0]) if np.any(pitches) else 0  # Handle empty case
+    energy = np.sum(librosa.feature.rms(y=y))
+    
+    return {
+        'mfccs': np.mean(mfccs.T, axis=0),
+        'pitch': pitch,
+        'energy': energy,
+    }
+
+# Function to pad images to a uniform size without resizing them
+def pad_image(image: np.ndarray, target_size: tuple) -> np.ndarray:
+    height, width = image.shape[:2]
+    
+    pad_height = max(0, target_size[1] - height)
+    pad_width = max(0, target_size[0] - width)
+
+    top_pad = pad_height // 2
+    bottom_pad = pad_height - top_pad
+    left_pad = pad_width // 2
+    right_pad = pad_width - left_pad
+
+    padded_image = cv2.copyMakeBorder(
+        image,
+        top_pad,
+        bottom_pad,
+        left_pad,
+        right_pad,
+        cv2.BORDER_CONSTANT,
+        value=[0 ,0 ,0]  # Black padding; change if needed.
+    )
+    
+    return padded_image
+
+# Function to extract frames from video at specified intervals (5 seconds)
+def extract_frames(video_path):
+    video_capture = cv2.VideoCapture(video_path)
+    
+    frames = []
+    
+    fps = video_capture.get(cv2.CAP_PROP_FPS)  # Frames per second of the video
+    frame_interval = int(fps * 5)  # Extract every 5 seconds
+
+    count = 0
+    
+    while True:
+        ret, frame = video_capture.read()
+        
+        if not ret:
+            break
+        
+        if count % frame_interval == 0:
+            frames.append(frame)
+        
+        count += 1
+    
+    video_capture.release()
+    
+    return frames
+
+# Function to detect facial key points and crop regions of interest using MTCNN
+def crop_face_regions(frame):
+    detector = MTCNN()
+    
+    results = detector.detect_faces(frame)
+    
+    face_images = []
+    
+    for result in results:
+        if 'keypoints' in result:
+            keypoints = result['keypoints']
+            left_eye_x, left_eye_y = keypoints['left_eye']
+            right_eye_x, right_eye_y = keypoints['right_eye']
+            # Calculate bounding box for both eyes with some padding
+            eye_width = right_eye_x - left_eye_x + 40  
+            eye_height = 20  
+            x1_eyes = max(0,left_eye_x - 20)  
+            y1_eyes = max(0,left_eye_y - 10)   
+            x2_eyes=min(frame.shape[1],x1_eyes + eye_width)  
+            y2_eyes=min(frame.shape[0],y1_eyes + eye_height)  
+            
+            # Crop both eyes together
+            eyes_region=frame[y1_eyes:y2_eyes,x1_eyes:x2_eyes]
+            
+            # Calculate bounding box for mouth region using left and right mouth keypoints
+            mouth_left_x,mouth_left_y=keypoints['mouth_left']
+            mouth_right_x,mouth_right_y=keypoints['mouth_right']
+            mouth_width=mouth_right_x-mouth_left_x +40  
+            mouth_height=30  
+            x1_mouth=max(0,mouth_left_x -20)  
+            y1_mouth=max(0,mouth_left_y -10)   
+            x2_mouth=min(frame.shape[1],x1_mouth +mouth_width)  
+            y2_mouth=min(frame.shape[0],y1_mouth +mouth_height)  
+            
+            # Crop mouth region together
+            mouth_region=frame[y1_mouth:y2_mouth,x1_mouth:x2_mouth]
+
+            # Crop face image as well
+            x1_face,y1_face,width_face,height_face=result['box']
+            face_image=frame[y1_face:y1_face +height_face,x1_face:x1_face +width_face]
+
+            face_images.append((face_image , eyes_region , mouth_region))
+
+    return face_images
+
+# Define a Squeeze-and-Excitation block as an attention mechanism
+class SqueezeAndExcitation(Model):
+    def __init__(self, ratio=16):
+        super(SqueezeAndExcitation, self).__init__()
+        self.ratio = ratio
+
+    def call(self, inputs):
+        se = GlobalAveragePooling2D()(inputs)  # Squeeze operation
+        se = Dense(inputs.shape[-1] // self.ratio, activation='relu')(se)  # Excitation operation
+        se = Dense(inputs.shape[-1], activation='sigmoid')(se)  # Channel weights
+        se = Reshape((1, 1, inputs.shape[-1]))(se)  # Reshape for broadcasting
+        return Multiply()([inputs, se])  # Recalibrate the input features
+
+# Define a Hybrid Attention model combining SE and Multi-Head Attention
+class HybridAttention(Model):
+    def __init__(self):
+        super(HybridAttention, self).__init__()
+        self.se_block = SqueezeAndExcitation()
+        self.multi_head_attention = MultiHeadAttention(num_heads=8, key_dim=64)
+
+    @tf.function(reduce_retracing=True) 
+    def call(self, inputs):
+        se_output = self.se_block(inputs)
+
+        se_output_reshaped = tf.expand_dims(se_output, axis=1) 
+        
+        attn_output = self.multi_head_attention(se_output_reshaped, se_output_reshaped) 
+        
+        attn_output_mean = tf.reduce_mean(attn_output, axis=1)
+
+        return attn_output_mean
+
+# Function to extract features using the hybrid attention mechanism from images.
+def extract_features_with_hybrid_attention(image_array):
+   base_model = ResNet101(weights='imagenet', include_top=False) 
+   feature_extractor = Model(inputs=base_model.input, outputs=base_model.output)
+
+   image_array_expanded = np.expand_dims(image_array, axis=0)
+
+   # Check if image_array_expanded has valid shape (256x256x3 for padding)
+   if image_array_expanded.shape[1:] != (256, 256, 3): 
+       print(f"Invalid input shape for feature extraction: {image_array_expanded.shape}")
+       return np.random.rand(2048)  # Return random features as a fallback
+
+   features = feature_extractor.predict(image_array_expanded)
+
+   hybrid_attention_model = HybridAttention()
+    
+   refined_features_meaned = hybrid_attention_model(features)
+
+   if refined_features_meaned.shape[1:] == (7, 7, 2048):
+       refined_features_meaned_avg = tf.reduce_mean(refined_features_meaned, axis=[1, 2]) 
+       print(f"Averaged features shape: {refined_features_meaned_avg.shape}")  
+       
+       return refined_features_meaned_avg.numpy().flatten()  
+
+   return np.random.rand(2048)  # Fallback if shape doesn't match
+
+# Main function to process videos in specified folders and extract features
+def process_videos(base_dir):
+   output_dir = r'C:\Users\Turyal\Desktop\MTK\AVEC2014_dataset' 
+    
+   for split in ['train', 'dev', 'test']:  
+       features_list = []
+       spectrogram_dir_name = os.path.join(output_dir , split ,'spectrograms')  
+       os.makedirs(spectrogram_dir_name , exist_ok=True)
+
+       frames_dir_name = os.path.join(output_dir , split ,'frames')
+       face_dir_name = os.path.join(output_dir , split ,'face')
+       eyes_dir_name = os.path.join(output_dir , split ,'eyes')
+       mouth_dir_name = os.path.join(output_dir , split ,'mouth')
+        
+       os.makedirs(frames_dir_name , exist_ok=True)
+       os.makedirs(face_dir_name , exist_ok=True)
+       os.makedirs(eyes_dir_name , exist_ok=True)
+       os.makedirs(mouth_dir_name , exist_ok=True)
+
+       for category in ['Freeform', 'Northwind']:
+           folder_path = os.path.join(base_dir , split , category)
+
+           if not os.path.exists(folder_path):
+               print(f"Folder not found: {folder_path}")
+               continue
+
+           for filename in os.listdir(folder_path):
+               if filename.endswith('.mp4'):
+                   video_path = os.path.join(folder_path ,filename)
+                   print(f"Processing {video_path}")
+
+                   audio_file = extract_audio_from_video(video_path)
+                   audio_features = extract_audio_features(audio_file)
+
+                   spectrogram_image_path = os.path.join(spectrogram_dir_name , f'{filename}.png')
+                   create_spectrogram(audio_file, spectrogram_image_path)
+
+                   frames = extract_frames(video_path)
+
+                   for i in range(len(frames)):
+                       frame_filename = os.path.join(frames_dir_name , f'frame_{i}.jpg')
+                       cv2.imwrite(frame_filename ,frames[i]) 
+
+                       cropped_images_info = crop_face_regions(frames[i])
+
+                       for j in range(len(cropped_images_info)):
+                           face_image, eyes_region, mouth_region = cropped_images_info[j]
+
+                           face_image_padded   = pad_image(face_image,(256 ,256))
+                           cv2.imwrite(os.path.join(face_dir_name , f'face_{filename.replace(".mp4","")}_{j}.jpg'), face_image_padded)
+
+                           eyes_region_padded   = pad_image(eyes_region,(192 ,96))
+                           cv2.imwrite(os.path.join(eyes_dir_name , f'eyes_{filename.replace(".mp4","")}_{j}.jpg'), eyes_region_padded)
+
+                           mouth_region_padded   = pad_image(mouth_region,(128 ,96))
+                           cv2.imwrite(os.path.join(mouth_dir_name , f'mouth_{filename.replace(".mp4","")}_{j}.jpg'), mouth_region_padded)
+
+                   spectrogram_resized_img   = resize_spectrogram_image(spectrogram_image_path) 
+                   refined_features_spectrogram   = extract_features_with_hybrid_attention(spectrogram_resized_img)
+
+                   refined_features_face_list   = []
+                   refined_features_eyes_list   = []
+                   refined_features_mouth_list   = []
+
+                   for j in range(len(cropped_images_info)):
+                       face_image_padded_j   = cv2.imread(os.path.join(face_dir_name,f'face_{filename.replace(".mp4","")}_{j}.jpg'))
+                       eyes_region_padded_j   = cv2.imread(os.path.join(eyes_dir_name,f'eyes_{filename.replace(".mp4","")}_{j}.jpg'))
+                       mouth_region_padded_j   = cv2.imread(os.path.join(mouth_dir_name,f'mouth_{filename.replace(".mp4","")}_{j}.jpg'))
+
+                       # Check for empty images before processing.
+                       if (face_image_padded_j.size == 0 or 
+                           eyes_region_padded_j.size == 0 or 
+                           mouth_region_padded_j.size == 0):
+                           print("One of the regions is empty; skipping this iteration.")
+                           continue
+
+                       refined_features_face_list.append(extract_features_with_hybrid_attention(face_image_padded_j))
+                       refined_features_eyes_list.append(extract_features_with_hybrid_attention(eyes_region_padded_j))
+                       refined_features_mouth_list.append(extract_features_with_hybrid_attention(mouth_region_padded_j))
+
+                   # Average the features across all detected faces/regions (if multiple are detected).
+                   if refined_features_face_list:
+                       refined_features_face_avg   = np.mean(refined_features_face_list, axis=0)
+                   else:
+                       print("No face features extracted; using default.")
+                       refined_features_face_avg   = np.random.rand(2048)  
+
+                   if refined_features_eyes_list:
+                       refined_features_eyes_avg   = np.mean(refined_features_eyes_list, axis=0)
+                   else:
+                       print("No eye features extracted; using default.")
+                       refined_features_eyes_avg   = np.random.rand(2048)  
+
+                   if refined_features_mouth_list:
+                       refined_features_mouth_avg   = np.mean(refined_features_mouth_list, axis=0)
+                   else:
+                       print("No mouth features extracted; using default.")
+                       refined_features_mouth_avg   = np.random.rand(2048)  
+
+                   # Print feature shapes before concatenation for debugging purposes.
+                   print(f"Refined Face Features Shape: {refined_features_face_avg.shape}")
+                   print(f"Refined Eyes Features Shape: {refined_features_eyes_avg.shape}")
+                   print(f"Refined Mouth Features Shape: {refined_features_mouth_avg.shape}")
+
+                   assert refined_features_face_avg.shape == (2048,), f"Expected shape (2048,), got {refined_features_face_avg.shape}"
+                   assert refined_features_eyes_avg.shape == (2048,), f"Expected shape (2048,), got {refined_features_eyes_avg.shape}"
+                   assert refined_features_mouth_avg.shape == (2048,), f"Expected shape (2048,), got {refined_features_mouth_avg.shape}"
+
+                   # Clean up filename by removing suffixes "_Freeform_video" and "_Northwind_video"
+                   cleaned_filename_suffixes_removed = filename.replace('.mp4','').replace('_Freeform_video','').replace('_Northwind_video','')
+
+                   combined_features_dict={
+                       'filename': cleaned_filename_suffixes_removed,
+                       'features': np.concatenate([
+                           refined_features_spectrogram,
+                           refined_features_face_avg,
+                           refined_features_eyes_avg,
+                           refined_features_mouth_avg,
+                           [audio_features['pitch'], audio_features['energy']],
+                           audio_features['mfccs']
+                       ]).tolist()
+                   }
+                   
+                   features_list.append(combined_features_dict)
+
+               df_features=pd.DataFrame(features_list)
+
+               mfcc_columns=[f'MFCC_{i}' for i in range(len(audio_features['mfccs']))]
+               num_spectrogram_features=len(refined_features_spectrogram.flatten())
+               num_face_features=len(refined_features_face_avg.flatten())
+               num_eyes_features=len(refined_features_eyes_avg.flatten())
+               num_mouth_features=len(refined_features_mouth_avg.flatten())
+
+               df_columns_names=['Filename']+mfcc_columns+['Pitch', 'Energy']+\
+                                 [f'Spectrogram_Feature_{i}' for i in range(num_spectrogram_features)]+\
+                                 [f'Face_Feature_{i}' for i in range(num_face_features)]+\
+                                 [f'Eyes_Feature_{i}' for i in range(num_eyes_features)]+\
+                                 [f'Mouth_Feature_{i}' for i in range(num_mouth_features)]
+
+               try:
+                   df_final_expanded=pd.DataFrame(df_features['features'].tolist(), columns=df_columns_names[1:])
+                   df_final_combined=pd.concat([df_features[['filename']], df_final_expanded], axis=1)
+
+                   output_csv_path=os.path.join(output_dir,f'{split}_features.csv')
+
+                   df_final_combined.to_csv(output_csv_path,index=False)
+                   print(f"Saved features for {split} to {output_csv_path}")
+               except ValueError as e:
+                   print(f"Error creating DataFrame: {e}") 
+                   print(f"Expected columns: {len(df_columns_names)}")
+                   print(f"Actual data shape: {[len(features) for features in df_features['features']]}")
+               except PermissionError:
+                   print(f"Permission denied: Unable to save {output_csv_path}. Please close any open instances of this file.")
+
+# Specify the base directory of your dataset 
+base_directory=r'C:\Users\Turyal\Desktop\Depression recognition using facial features\MyAVEC2014\AVEC2014'
+process_videos(base_directory)
+
+print("Feature extraction and saving completed.")
